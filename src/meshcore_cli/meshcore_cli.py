@@ -37,6 +37,21 @@ from meshcore import MeshCore, EventType, logger
 # Version
 VERSION = "v1.5.7"
 
+# Companion protocol additions (MeshCore fw >= 1.15.1+)
+CMD_SET_BATTERY_SOC_CURVE = 65
+BATTERY_TYPE_TO_CURVE = {
+    "linear": 0,
+    "lipo": 1,
+    "liion": 2,
+    "li-ion": 2,
+}
+CURVE_TO_BATTERY_TYPE = {
+    0: "linear",
+    1: "lipo",
+    2: "liion",
+}
+CMD_GET_BATTERY_SOC_CURVE = 66
+
 # default ble address is stored in a config file
 MCCLI_CONFIG_DIR = str(Path.home()) + "/.config/meshcore/"
 MCCLI_ADDRESS = MCCLI_CONFIG_DIR + "default_address"
@@ -46,6 +61,30 @@ MCCLI_INIT_SCRIPT = MCCLI_CONFIG_DIR + "init"
 PAYLOAD_TYPENAMES = ["REQ", "RESPONSE", "TEXT_MSG", "ACK", "ADVERT", "GRP_TXT", "GRP_DATA", "ANON_REQ", "PATH", "TRACE", "MULTIPART", "CONTROL"]
 ROUTE_TYPENAMES = ["TC_FLOOD", "FLOOD", "DIRECT", "TC_DIRECT"]
 CONTACT_TYPENAMES = ["NONE","CLI","REP","ROOM","SENS"]
+
+
+def normalize_battery_type(name):
+    if name is None:
+        return None
+    value = name.lower()
+    if value not in BATTERY_TYPE_TO_CURVE:
+        return None
+    # Keep one canonical spelling for display/json output.
+    return "liion" if value == "li-ion" else value
+
+
+def normalize_battery_curve(curve):
+    if isinstance(curve, str):
+        if curve.isdigit():
+            curve = int(curve)
+        else:
+            key = normalize_battery_type(curve)
+            if key is None:
+                return None
+            return BATTERY_TYPE_TO_CURVE[key]
+    if isinstance(curve, int):
+        return curve if curve in CURVE_TO_BATTERY_TYPE else None
+    return None
 
 # Fallback address if config file not found
 # if None or "" then a scan is performed
@@ -580,6 +619,7 @@ def make_completion_dict(contacts, pending={}, to=None, channels=None):
             "telemetry_mode_loc" : {"always" : None, "device":None, "never":None},
             "telemetry_mode_env" : {"always" : None, "device":None, "never":None},
             "advert_loc_policy" : {"none" : None, "share" : None},
+            "battery.type": {"linear": None, "lipo": None, "liion": None},
             "auto_update_contacts" : {"on":None, "off":None},
             "multi_acks" : {"on": None, "off":None},
             "max_attempts" : None,
@@ -615,6 +655,7 @@ def make_completion_dict(contacts, pending={}, to=None, channels=None):
             "telemetry_mode_loc":None,
             "telemetry_mode_env":None,
             "advert_loc_policy":None,
+            "battery.type":None,
             "auto_update_contacts":None,
             "multi_acks":None,
             "max_attempts":None,
@@ -2245,6 +2286,22 @@ async def next_cmd(mc, cmds, json_output=False):
                             print(f"Error : {res}")
                         else:
                             print(f"Policy for adv_loc: {policy}")
+                    case "battery.type":
+                        battery_type = normalize_battery_type(cmds[2])
+                        if battery_type is None:
+                            print("Error: battery.type must be one of linear, lipo, liion")
+                        else:
+                            curve = BATTERY_TYPE_TO_CURVE[battery_type]
+                            res = await mc.commands.send(
+                                bytes([CMD_SET_BATTERY_SOC_CURVE, curve]),
+                                [EventType.OK, EventType.ERROR],
+                            )
+                            if res.type == EventType.ERROR:
+                                print(f"Error : {res}")
+                            elif json_output:
+                                print(json.dumps({"battery.type": battery_type, "curve": curve}))
+                            else:
+                                print("ok")
                     case "default_scope":
                         res = await mc.commands.set_default_flood_scope(cmds[2])
                         if res.type == EventType.ERROR:
@@ -2483,6 +2540,49 @@ async def next_cmd(mc, cmds, json_output=False):
                             print(json.dumps({"advert_loc_policy" : mc.self_info["adv_loc_policy"]}))
                         else :
                             print(f"advert_loc_policy: {mc.self_info['adv_loc_policy']}")
+                    case "battery.type":
+                        res = None
+
+                        # Newer meshcore-py may expose a direct helper.
+                        if hasattr(mc.commands, "get_battery_soc_curve"):
+                            res = await mc.commands.get_battery_soc_curve()
+                        elif hasattr(EventType, "BATTERY_SOC_CURVE"):
+                            # Mid-version fallback: event type exists, helper does not.
+                            res = await mc.commands.send(
+                                bytes([CMD_GET_BATTERY_SOC_CURVE]),
+                                [EventType.BATTERY_SOC_CURVE, EventType.ERROR],
+                            )
+                        else:
+                            # Legacy meshcore-py fallback: send raw GET and try reading first response event.
+                            await mc.commands.send(bytes([CMD_GET_BATTERY_SOC_CURVE]))
+                            res = await mc.dispatcher.wait_for_event(None, timeout=2)
+                            if res is None:
+                                print("Error: timeout waiting for battery.type response")
+                        if res is not None and res.type == EventType.ERROR:
+                            print(f"Error : {res}")
+                        elif res is None:
+                            pass
+                        else:
+                            payload = res.payload if isinstance(res.payload, dict) else {}
+                            curve = normalize_battery_curve(payload.get("curve"))
+                            if curve is None:
+                                curve = normalize_battery_curve(payload.get("battery_soc_curve"))
+                            if curve is None:
+                                curve = normalize_battery_curve(payload.get("battery_type"))
+                            if curve is None and isinstance(res.payload, int):
+                                curve = normalize_battery_curve(res.payload)
+
+                            if curve is None:
+                                if json_output:
+                                    print(json.dumps({"error": "unsupported battery.type response", "payload": payload}))
+                                else:
+                                    print("Error: could not decode battery.type response from meshcore library")
+                            else:
+                                battery_type = CURVE_TO_BATTERY_TYPE[curve]
+                                if json_output:
+                                    print(json.dumps({"battery.type": battery_type, "curve": curve}))
+                                else:
+                                    print(f"battery.type: {battery_type}")
                     case "auto_update_contacts" :
                         if json_output :
                             print(json.dumps({"auto_update_contacts" : mc.auto_update_contacts}))
@@ -3830,6 +3930,7 @@ def get_help_for (cmdname, context="line") :
     stats_packets      : packets stats (recv/sent/flood/direct)
     allowed_repeat_freq: possible frequency ranges for repeater mode
     path_hash_mode
+    battery.type
 """)
 
     elif cmdname == "set" :
@@ -3855,6 +3956,7 @@ def get_help_for (cmdname, context="line") :
         (pending contacts list is built by meshcli from adverts while connected)
     autoadd_config              : set autoadd_config flags (see ?autoadd)
     path_hash_mode <value>
+    battery.type <linear|lipo|liion>
   display:
     print_timestamp <on/off/fmt>: toggle printing of timestamp, can be strftime format
     print_snr <on/off>          : toggle snr display in messages
@@ -4058,7 +4160,7 @@ REPEATER_COMMANDS = {
         "bridge.source": None, "bridge.baud": None,
         "bridge.channel": None, "bridge.secret": None, "bridge.type": None,
         "adc.multiplier": None, "acl": None,
-        "owner.info": None,
+        "owner.info": None, "battery.type": None,
     },
     "set": {
         "name": None, "radio": None, "tx": None, "freq": None,
@@ -4074,6 +4176,7 @@ REPEATER_COMMANDS = {
         "bridge.baud": None, "bridge.channel": None, "bridge.secret": None,
         "adc.multiplier": None,
         "owner.info": None,
+        "battery.type": {"linear": None, "lipo": None, "liion": None},
     },
     "powersaving": {"on":None, "off":None,},
     "password": None,
@@ -4120,6 +4223,7 @@ REPEATER_HELP = f"""
   get public.key      - Node public key
   get advert.interval - Advertisement interval (minutes)
   get owner.info      - Owner information
+  get battery.type    - Battery SOC curve (linear/lipo/liion)
 
   set name <name>     - Set node name
   set tx <power>      - Set TX power (dBm)
@@ -4127,6 +4231,7 @@ REPEATER_HELP = f"""
   set radio f,bw,sf,cr - Set radio params (reboot to apply)
   set advert.interval <min> - Set advert interval (60-240 min)
   set owner.info <i>  - Set owner information
+  set battery.type <linear|lipo|liion> - Set battery SOC curve
 
 {ANSI_BGREEN}Region management:{ANSI_END}
   region             - display currently configured regions
