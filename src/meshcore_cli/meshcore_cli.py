@@ -2743,6 +2743,9 @@ async def next_cmd(mc: MeshCore, cmds, json_output=False):
                         print(f"Error sending message: {res}")
                     elif json_output :
                         print(json.dumps(res.payload, indent=4))
+                    else:
+                        route = "transport_flood" if res.payload["type"] == 1 else "direct"
+                        print(f"Sent ({route}), packet hash: {res.payload['expected_ack']}")
 
             case "chan"|"ch" :
                 argnum = 2
